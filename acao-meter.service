@@ -1,0 +1,20 @@
+[Unit]
+Description=ACAO SDM120C meter receiver
+Wants=
+After=network.target
+
+[Service]
+Type=notify
+
+User=yggdra
+Group=yggdra
+
+ExecStart=/usr/local/bin/acao-meter
+
+Restart=always
+
+TimeoutStartSec=15
+WatchdogSec=10
+
+[Install]
+WantedBy=multi-user.target
