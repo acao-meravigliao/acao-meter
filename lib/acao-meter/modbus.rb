@@ -109,10 +109,10 @@ class ModBus
 
       raise InvalidCRC if crc != crc16(header + payload)
 
-      new(address: address, function: function, payload_size: payload_size / 2, payload: payload.unpack('s>*'))
+      new(address: address, function: function, payload_size: payload_size / 2, payload: payload)
     end
 
-    def get_32f(idx)
+    def get_f32(idx)
       @payload[(idx*2)..((idx+2)*2)].unpack('g').first
     end
   end

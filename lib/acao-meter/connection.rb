@@ -19,18 +19,23 @@ class Connection
         ipv4: true,
         ipv6: true,
         bind_to: nil,
+        keep_connected: false,
+        connect_later: false,
         reconnect_delay: 3,
         reconnect_backoff: 2,
         reconnect_max_delay: 60,
         debug: 0,
         debug_data: false,
         debug_serial: false,
-        debug_serial_raw: false)
+        debug_serial_raw: false,
+        **args)
 
     @host = host
     @port = port
     @ipv4 = ipv4
     @ipv6 = ipv6
+    @connect_later = connect_later
+    @keep_connected = keep_connected
     @reconnect_delay = reconnect_delay
     @reconnect_backoff = reconnect_backoff
     @reconnect_max_delay = reconnect_max_delay
@@ -40,12 +45,11 @@ class Connection
     @debug_serial = debug_serial
     @debug_serial_raw = debug_serial_raw
 
-    @state = :disconnected
-
-    actor_initialize
+    actor_initialize(**args)
   end
 
   def actor_boot
+    @state = :disconnected
 
     @address_selector = AddressSelector.new(
       name: @host, service: @port, socktype: :STREAM,
@@ -64,50 +68,106 @@ class Connection
       reverse_energy: { addr: 2, idx: 0xF201, },
     }
 
-    reset_state!
+    @vars_iterator = @vars.each
 
-    connect!
+    start_connection! unless @connect_later
   end
 
-  def reset_state!
+  def init_state!
     @out_buffer = VihaiIoBuffer.new
     @in_buffer = VihaiIoBuffer.new
 
     @socket = nil
   end
 
-  def init_socket!
-    @address_selector.update!
+  def start_connection!
+    init_state!
 
-    raise "XXX No address found" if !@address_selector.current
+    case @state
+    when :disconnected, :connection_failure
+      @address_selector.reset_attempts_counters!
+    else
+      @reconnect_channels = @saved_channels
+      @saved_channels = nil
+    end
 
-    debug2 { "Sorted address list:\n" + @address_selector.list.map { |x|
-             "  #{x.addrinfo.inspect} - last_attempt=#{x.last_attempt}," +
-             " last_success=#{x.last_success}, last_failure=#{x.last_failure}"
-           }.join("\n") }
-    debug1 { "Connecting to '#{@address_selector.current.inspect}'" }
+    change_state!(:connect_resolving)
+
+    debug1 { "Resolving to connect..." }
+
+    @resolver = @address_selector.start_resolver(report_to: self)
+  end
+
+  def resolving_complete!
+    debug2 { "Resolution complete, address selector state:\n" + @address_selector.inspect }
+
+    if @address_selector.empty?
+      reconnect_delay = 5.seconds
+
+      debug1 { "No address available, we should wait #{'%.3f' % reconnect_delay} seconds" }
+
+      change_state!(:connect_waiting)
+      @connect_delay_timer = delay(reconnect_delay) do
+        start_connection!
+      end
+
+      return
+    end
+
+    if @address_selector.current.last_attempt
+      debug2 { "This is not the first attempt" }
+
+      reconnect_delay = [ @reconnect_delay * ((@reconnect_backoff ** @address_selector.current.attempt_count) - 1),
+                          @reconnect_max_delay ].min
+      time_from_last = Time.now - @address_selector.current.last_attempt
+
+      debug3 { "Should we wait #{time_from_last} < #{reconnect_delay} ?" }
+
+      if time_from_last < reconnect_delay
+        actual_delay = reconnect_delay - time_from_last
+        debug2 { "This is not the first attempt, we should wait #{'%.3f' % actual_delay} seconds" }
+
+        change_state!(:connect_waiting)
+        @connect_delay_timer = delay(actual_delay) do
+          do_connect!
+        end
+      else
+        do_connect!
+      end
+    else
+      do_connect!
+    end
+  end
+
+  class NoAddressesFound < StandardError ; end
+
+  def do_connect!
+    change_state!(:connecting)
+
+    debug2 { "Picking an address..." }
+
+    if !@address_selector.current
+      connection_closed!(cause: NoAddressesFound.new)
+      return
+    end
+
+    debug1 { "Connecting to '#{@address_selector.current.inspect_addr}'" }
 
     @socket = Socket.new(@address_selector.current.addrinfo.ipv6? ? Socket::AF_INET6 : Socket::AF_INET, Socket::SOCK_STREAM, 0)
     @socket.bind(Socket.pack_sockaddr_in(0, @bind_to)) if @bind_to
     @socket.setsockopt(Socket::IPPROTO_TCP, Socket::TCP_NODELAY, 1)
+    #@socket.setsockopt(Socket::IPPROTO_TCP, 18, [ 3000 ].pack("l"))
 
-    actor_epoll.add(@socket, SleepyPenguin::Epoll::IN)
-  end
-
-  def connect!
-    change_state! :connecting
-
-    init_socket!
+    actor_epoll.add(@socket, AM::Epoll::IN)
 
     @address_selector.attempting!
 
     begin
       @socket.connect_nonblock(@address_selector.current.addrinfo)
     rescue IO::WaitWritable
-      actor_epoll.mod(@socket, SleepyPenguin::Epoll::IN | SleepyPenguin::Epoll::OUT)
+      actor_epoll.mod(@socket, AM::Epoll::IN | AM::Epoll::OUT)
     rescue SystemCallError, IOError => e
-      @address_selector.failure!
-      connection_lost!(cause: e)
+      connection_closed!(cause: e)
       return
     else
       connected!
@@ -117,11 +177,9 @@ class Connection
   def connected!
     @address_selector.success!
 
-    @socket.send(AMQ::Protocol::PREAMBLE, 0)
-
-    change_state! :open
-
     @poll_current_idx = 0
+
+    change_state! :ready
 
     run_poll_queue
 
@@ -132,114 +190,78 @@ class Connection
 #    end
   end
 
-  def connection_lost!(cause: nil)
-    log.warn("CONNECTION LOST: #{cause}")
+  def connection_closed!(cause: nil)
+    log.warn("Connection closed in state #{@state}: #{cause}")
 
-    connection_cleanup!
-
-    attempt_reconnection!
-  end
-
-  def attempt_reconnection!
-    if @state != :reconnecting
-      @address_selector.reset_attempts_counters!
-
-      @reconnect_started = Time.now
-
-      debug1 { "Entering reconnect state at #{@reconnect_started}" }
-
-      reset_state!
-
-      change_state! :reconnecting
+    if @resolver
+      @resolver.kill
+      @resolver = nil
     end
 
-    if @address_selector.current.last_attempt
-      reconnect_delay = [ @reconnect_delay * (@reconnect_backoff ** @address_selector.current.attempt_count),
-                          @reconnect_max_delay ].min
-
-      time_from_last = Time.now - @address_selector.current.last_attempt
-
-      debug2 { "Should we wait a grace period? #{time_from_last} < #{reconnect_delay} ?" }
-
-      if time_from_last < reconnect_delay
-        debug2 { "No, wait #{reconnect_delay - time_from_last} seconds" }
-
-        delay(reconnect_delay - time_from_last) do
-          reconnect!
-        end
-      else
-        debug2 { 'Yes, reconnect immediately' }
-        reconnect!
-      end
-    else
-      reconnect!
-    end
-  end
-
-  def reconnect!
-    debug1 { "Reconnecting!" }
-
-    init_socket!
-
-    @address_selector.attempting!
-
-    begin
-      @socket.connect_nonblock(@address_selector.current.addrinfo)
-    rescue IO::WaitWritable
-      actor_epoll.mod(@socket, SleepyPenguin::Epoll::IN | SleepyPenguin::Epoll::OUT)
-    rescue SystemCallError => e
-      @address_selector.failure!
-      connection_lost!(cause: e)
-      return
-    else
-      connected!
-    end
-  end
-
-  def connection_cleanup!
-    if @heartbeat_timeout_timer
-      @heartbeat_timeout_timer.stop!
-      @heartbeat_timeout_timer = nil
-    end
-
-    if @heartbeat_tx_timer
-      @heartbeat_tx_timer.stop!
-      @heartbeat_tx_timer = nil
+    if @connect_delay_timer
+      @connect_delay_timer.stop!
+      @connect_delay_timer = nil
     end
 
     if @socket
-      actor_epoll.del @socket
+      actor_epoll.del(@socket)
       @socket.close
       @socket = nil
+    end
+
+    case @state
+    when :connect_resolving, :connect_waiting, :connecting, :ready, :disconnecting_by_srv
+
+      @address_selector.failure!
+
+      if @address_selector.attempted_all?
+        debug2 { "All addresses attempted, making connection requests fail" }
+
+        @address_selector.reset_attempt_flags!
+
+        @connect_requests.each { |x| actor_reply(x, MsgConnectFailure.new(cause: (@disconnecting_cause || cause))) }
+        @connect_requests = []
+      end
+
+      @saved_channels = @channels.dup
+
+      @channels.each do |channel_id, channel|
+        channel.connection_closed!(
+          permanent: !@keep_connected,
+          reply_code: @disconnecting_cause ? @disconnecting_cause.code : 500,
+          reply_text: @disconnecting_cause ? @disconnecting_cause.text : cause.to_s,
+        )
+      end
+
+      if @keep_connected
+        start_connection!
+      else
+        change_state!(:connection_failure)
+      end
+
+    when :disconnecting_by_us
+      disconnected_by_us!
+    else
+      raise "Unexpected connection failure in state #{@state}"
     end
   end
 
   def flush_out_buffer!
-    debug_serial_raw { "RAW TX: #{@out_buffer.to_s.unpack('H*')}" }
-
     begin
       sent = @out_buffer.write_nonblock_to(@socket)
     rescue IO::WaitWritable
-      actor_epoll.mod(@socket, SleepyPenguin::Epoll::IN | SleepyPenguin::Epoll::OUT)
-    rescue Errno::ECONNRESET => e
-      if @state == :disconnecting_by_srv
-        out_buffer_empty!
-      else
-        connection_lost!(cause: e)
-      end
-
-      return
+      actor_epoll.mod(@socket, AM::Epoll::IN | AM::Epoll::OUT)
     rescue SystemCallError, IOError => e
-      connection_lost!(cause: e)
+      connection_closed!(cause: e)
       return
     end
 
     if sent == 0
-      actor_epoll.mod(@socket, SleepyPenguin::Epoll::IN | SleepyPenguin::Epoll::OUT)
+      actor_epoll.mod(@socket, AM::Epoll::IN | AM::Epoll::OUT)
     end
 
     if @out_buffer.empty?
-      actor_epoll.mod(@socket, SleepyPenguin::Epoll::IN)
+      actor_epoll.mod(@socket, AM::Epoll::IN)
 
       out_buffer_empty!
     end
@@ -248,16 +270,24 @@ class Connection
   def out_buffer_empty!
   end
 
-  def receive(events, io)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  def actor_receive(events, io)
     case io
     when @socket
-      if (events & SleepyPenguin::Epoll::IN) != 0
-        receive_from_socket(events, io)
-      end
-
-      # @socket may change as a consequence of receive_from_socket so we better check and desist in case
-      return if io != @socket
-
       if (events & SleepyPenguin::Epoll::OUT) != 0
         case @state
         when :connecting, :reconnecting
@@ -273,6 +303,41 @@ class Connection
         else
           flush_out_buffer!
         end
+      end
+
+      # @socket may change as a consequence of receive_from_socket so we better check and desist in case
+      return if io != @socket
+
+      if (events & SleepyPenguin::Epoll::IN) != 0
+        receive_from_socket(events, io)
+      end
+    else
+      super
+    end
+  end
+
+  def actor_handle(message)
+    case message
+    when AM::Actor::MsgExited
+      case @state
+      when :connect_resolving
+        if message.sender == @resolver
+          @address_selector.resolve_done!(message.exit_result)
+          resolving_complete!
+        end
+      else
+        # Ignore for now, report and error when resolution cancelling will be available
+      end
+
+    when AM::Actor::MsgCrashed
+      case @state
+      when :connect_resolving
+        if message.sender == @resolver
+          log.warn "Resolution failed: #{message.exception}"
+          resolving_complete!
+        end
+      else
+        # Ignore for now, report and error when resolution cancelling will be available
       end
     else
       super
@@ -303,14 +368,13 @@ class Connection
   end
 
   def run_poll_queue
-    return if @poll_current_idx
 
-    var = @vars[@poll_current_idx]
+    (var_name , var) = @vars_iterator.next
 
     @poll_current_req = ModBus::Req.new(address: var[:addr], function: 0x04, range: (var[:idx]..(var[:idx]+1)))
     send_frame(@poll_current_req.to_net)
 
-    @poll_timer = after(2.seconds) do
+    @poll_timer = delay(2.seconds) do
       log.warn "Request addr=#{var[:addr]} idx=#{var[:idx]} timeout"
     end
   end
@@ -332,12 +396,14 @@ class Connection
   end
 
   STATES = [
-    :open,
+    :connect_resolving,
+    :connect_waiting,
     :connecting,
-    :disconnected,
-    :reconnecting_failure,
-    :reconnecting,
+    :ready,
+    :disconnecting_by_us,
+    :disconnecting_by_srv,
     :connection_failure,
+    :disconnected,
   ].freeze
 
   def change_state!(new_state)
