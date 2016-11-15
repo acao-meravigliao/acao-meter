@@ -9,7 +9,7 @@ Type=notify
 User=yggdra
 Group=yggdra
 
-ExecStart=/usr/local/bin/acao-meter
+ExecStart=/usr/local/bin/acao_meter
 
 Restart=always
 

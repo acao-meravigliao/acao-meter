@@ -7,10 +7,10 @@
 #
 
 $:.push File.expand_path('../lib', __FILE__)
-require 'acao-meter/version'
+require 'acao_meter/version'
 
 Gem::Specification.new do |s|
-  s.name        = 'acao-meter'
+  s.name        = 'acao_meter'
   s.version     = AcaoMeter::VERSION
   s.authors     = ['Daniele Orlandi']
   s.email       = ['daniele@orlandi.com']
@@ -18,7 +18,7 @@ Gem::Specification.new do |s|
   s.summary     = %q{Polls SDM120C meters and publishes data to an AMQP exchange}
   s.description = %q{Polls SDM120C meters and publishes data to an AMQP exchange}
 
-  s.rubyforge_project = 'acao-meter'
+  s.rubyforge_project = 'acao_meter'
 
   s.files         = `git ls-files`.split("\n")
   s.test_files    = `git ls-files -- {test,spec,features}/*`.split("\n")

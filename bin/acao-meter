@@ -7,6 +7,6 @@
 # License:: You can redistribute it and/or modify it under the terms of the LICENSE file.
 #
 
-require 'acao-meter'
+require 'acao_meter'
 
 AcaoMeter::App.run_as_main!

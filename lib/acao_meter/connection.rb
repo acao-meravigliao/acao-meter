@@ -6,7 +6,7 @@
 # License:: You can redistribute it and/or modify it under the terms of the LICENSE file.
 #
 
-require 'acao-meter/modbus'
+require 'acao_meter/modbus'
 
 module AcaoMeter
 
@@ -28,6 +28,7 @@ class Connection
         debug_data: false,
         debug_serial: false,
         debug_serial_raw: false,
+        meters:,
         **args)
 
     @host = host
@@ -45,6 +46,8 @@ class Connection
     @debug_serial = debug_serial
     @debug_serial_raw = debug_serial_raw
 
+    @meters = meters
+
     actor_initialize(**args)
   end
 
@@ -56,19 +59,22 @@ class Connection
       family: (@ipv6 ? (@ipv4 ? nil : Socket::PF_INET6) : Socket::PF_INET),
     )
 
-    @vars = {
-      voltage: { addr: 2, idx: 0x0000, },
-      current: { addr: 2, idx: 0x0006, },
-      power: { addr: 2, idx: 0x000C, },
-      app_power: { addr: 2, idx: 0x0012, },
-      power_factor: { addr: 2, idx: 0x001E, },
-      frequency: { addr: 2, idx: 0x0046, },
-      total_energy: { addr: 2, idx: 0x0201, },
-      positive_energy: { addr: 2, idx: 0xF101, },
-      reverse_energy: { addr: 2, idx: 0xF201, },
+    @vars = []
+
+    @meters.each do |meter_uuid, meter|
+      @vars << { quantity: :voltage,       meter: meter, idx: 0x0000, }
+      @vars << { quantity: :current,       meter: meter, idx: 0x0006, },
+      @vars << { quantity: :power,         meter: meter, idx: 0x000C, },
+      @vars << { quantity: :app_power,     meter: meter, idx: 0x0012, },
+      @vars << { quantity: :rea_power,     meter: meter, idx: 0x0018, },
+      @vars << { quantity: :power_facto,   meter: meter, idx: 0x001E, },
+      @vars << { quantity: :frequency,     meter: meter, idx: 0x0046, },
+      @vars << { quantity: :import_energy, meter: meter, idx: 0x0048, },
+      @vars << { quantity: :export_energy, meter: meter, idx: 0x004A, },
+      @vars << { quantity: :total_energy,  meter: meter, idx: 0x0156, },
     }
 
-    @vars_iterator = @vars.each
+    @vars_iterator = @vars.each_with_index
 
     start_connection! unless @connect_later
   end
@@ -368,21 +374,30 @@ class Connection
   end
 
   def run_poll_queue
+    begin
+      (@current_var_idx , @current_var) = @vars_iterator.next
+    rescue StopIteration
+      @vars_iterator.rewind
+      retry
+    end
 
-    (var_name , var) = @vars_iterator.next
-
-    @poll_current_req = ModBus::Req.new(address: var[:addr], function: 0x04, range: (var[:idx]..(var[:idx]+1)))
+    @poll_current_req = ModBus::Req.new(address: @current_var[:meter][:bus_address], function: 0x04,
+                                        range: (@current_var[:idx]..(@current_var[:idx]+1)))
     send_frame(@poll_current_req.to_net)
 
     @poll_timer = delay(2.seconds) do
-      log.warn "Request addr=#{var[:addr]} idx=#{var[:idx]} timeout"
+      log.warn "Request addr=#{@current_var[:meter][:bus_address]} idx=#{@current_var[:idx]} timeout"
+      @in_buffer.clear
+      run_poll_queue
     end
   end
 
   def receive_frame(frame)
-    log.warn(frame.get_f32(0))
+    log.warn("RX FRAME #{@current_var_name} = #{frame.get_f32(0)}")
 
     @poll_timer.stop!
+
+    run_poll_queue
   end
 
   def send_frame(frame)
