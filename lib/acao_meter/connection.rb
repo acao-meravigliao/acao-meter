@@ -28,6 +28,9 @@ class Connection
         debug_data: false,
         debug_serial: false,
         debug_serial_raw: false,
+        amqp:,
+        amqp_chan:,
+        exchange:,
         meters:,
         **args)
 
@@ -46,6 +49,10 @@ class Connection
     @debug_serial = debug_serial
     @debug_serial_raw = debug_serial_raw
 
+    @amqp = amqp
+    @amqp_chan = amqp_chan
+    @exchange = exchange
+
     @meters = meters
 
     actor_initialize(**args)
@@ -59,22 +66,23 @@ class Connection
       family: (@ipv6 ? (@ipv4 ? nil : Socket::PF_INET6) : Socket::PF_INET),
     )
 
-    @vars = []
-
-    @meters.each do |meter_uuid, meter|
-      @vars << { quantity: :voltage,       meter: meter, idx: 0x0000, }
-      @vars << { quantity: :current,       meter: meter, idx: 0x0006, },
-      @vars << { quantity: :power,         meter: meter, idx: 0x000C, },
-      @vars << { quantity: :app_power,     meter: meter, idx: 0x0012, },
-      @vars << { quantity: :rea_power,     meter: meter, idx: 0x0018, },
-      @vars << { quantity: :power_facto,   meter: meter, idx: 0x001E, },
-      @vars << { quantity: :frequency,     meter: meter, idx: 0x0046, },
-      @vars << { quantity: :import_energy, meter: meter, idx: 0x0048, },
-      @vars << { quantity: :export_energy, meter: meter, idx: 0x004A, },
-      @vars << { quantity: :total_energy,  meter: meter, idx: 0x0156, },
+    @vars = {
+      voltage:         { idx: 0x0000, },
+      current:         { idx: 0x0006, },
+      power:           { idx: 0x000C, },
+      app_power:       { idx: 0x0012, },
+      rea_power:       { idx: 0x0018, },
+      power_factor:    { idx: 0x001E, },
+      frequency:       { idx: 0x0046, },
+      imported_energy: { idx: 0x0048, },
+      exported_energy: { idx: 0x004A, },
+      total_energy:    { idx: 0x0156, },
     }
 
-    @vars_iterator = @vars.each_with_index
+    @meters_iterator = @meters.each
+    @vars_iterator = @vars.each
+
+    @last_cycle = Time.now
 
     start_connection! unless @connect_later
   end
@@ -188,12 +196,6 @@ class Connection
     change_state! :ready
 
     run_poll_queue
-
-#    @poller = now_and_every(5.seconds) do
-#      @req = ModBus::Req.new(address: 2, function: 0x04, range: (0x0000..0x0001))
-#
-#      send_frame(@req.to_net)
-#    end
   end
 
   def connection_closed!(cause: nil)
@@ -275,21 +277,6 @@ class Connection
 
   def out_buffer_empty!
   end
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
   def actor_receive(events, io)
     case io
@@ -374,36 +361,84 @@ class Connection
   end
 
   def run_poll_queue
+
+    next_meter if !@current_meter
+
     begin
-      (@current_var_idx , @current_var) = @vars_iterator.next
+      ( @current_var_symbol, @current_var ) = @vars_iterator.next
     rescue StopIteration
-      @vars_iterator.rewind
-      retry
+      meter_completed
+
+      return
     end
 
-    @poll_current_req = ModBus::Req.new(address: @current_var[:meter][:bus_address], function: 0x04,
+    @poll_current_req = ModBus::Req.new(address: @current_meter[:bus_address], function: 0x04,
                                         range: (@current_var[:idx]..(@current_var[:idx]+1)))
     send_frame(@poll_current_req.to_net)
 
     @poll_timer = delay(2.seconds) do
-      log.warn "Request addr=#{@current_var[:meter][:bus_address]} idx=#{@current_var[:idx]} timeout"
+      log.warn "Request addr=#{@current_meter[:bus_address]} idx=#{@current_var[:idx]} timeout"
       @in_buffer.clear
       run_poll_queue
     end
   end
 
+  def next_meter
+    ( @current_meter_uuid, @current_meter ) = @meters_iterator.next
+    @current_meter_values = {}
+  end
+
+  def meter_completed
+    @amqp.tell AM::AMQP::MsgPublish.new(
+      channel_id: @amqp_chan,
+      exchange: @exchange,
+      payload: @current_meter_values.to_json,
+      routing_key: @current_meter_uuid,
+      persistent: false,
+      mandatory: false,
+      headers: {
+        'Content-type': 'application/json',
+        type: 'METER_UPDATE',
+      },
+    )
+
+    @vars_iterator.rewind
+    @current_meter_values = {}
+
+    begin
+      next_meter
+      run_poll_queue
+    rescue StopIteration
+      @meters_iterator.rewind
+      @current_meter = nil
+
+      cycle_completed
+    end
+  end
+
+  def cycle_completed
+    time_to_wait = 120.seconds - (Time.now - @last_cycle)
+
+    delay(time_to_wait) do
+      @last_cycle = Time.now
+      run_poll_queue
+    end
+  end
+
   def receive_frame(frame)
-    log.warn("RX FRAME #{@current_var_name} = #{frame.get_f32(0)}")
+    #log.debug("RX #{@current_var_symbol}=#{frame.get_f32(0)}")
+
+    @current_meter_values[@current_var_symbol] = frame.get_f32(0)
 
     @poll_timer.stop!
 
-    run_poll_queue
+    delay(0.25.seconds) do
+      run_poll_queue
+    end
   end
 
   def send_frame(frame)
     debug_serial { "TX: #{frame.unpack('H*')}" }
-
-#    @heartbeat_tx_timer.reset! if @heartbeat_tx_timer
 
     @out_buffer << frame
 
