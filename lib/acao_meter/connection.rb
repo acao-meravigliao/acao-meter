@@ -101,8 +101,6 @@ class Connection
     when :disconnected, :connection_failure
       @address_selector.reset_attempts_counters!
     else
-      @reconnect_channels = @saved_channels
-      @saved_channels = nil
     end
 
     change_state!(:connect_resolving)
@@ -193,6 +191,10 @@ class Connection
 
     @poll_current_idx = 0
 
+    @poll_timer = actor_set_timer(delay: 2.0, start: false) do
+      poll_timeout
+    end
+
     change_state! :ready
 
     run_poll_queue
@@ -200,6 +202,21 @@ class Connection
 
   def connection_closed!(cause: nil)
     log.warn("Connection closed in state #{@state}: #{cause}")
+
+    if @poll_timer
+      @poll_timer.stop!
+      @poll_timer = nil
+    end
+
+    if @cycle_timer
+      @cycle_timer.stop!
+      @cycle_timer = nil
+    end
+
+    if @inter_request_timer
+      @inter_request_timer.stop!
+      @inter_request_timer = nil
+    end
 
     if @resolver
       @resolver.kill
@@ -226,19 +243,6 @@ class Connection
         debug2 { "All addresses attempted, making connection requests fail" }
 
         @address_selector.reset_attempt_flags!
-
-        @connect_requests.each { |x| actor_reply(x, MsgConnectFailure.new(cause: (@disconnecting_cause || cause))) }
-        @connect_requests = []
-      end
-
-      @saved_channels = @channels.dup
-
-      @channels.each do |channel_id, channel|
-        channel.connection_closed!(
-          permanent: !@keep_connected,
-          reply_code: @disconnecting_cause ? @disconnecting_cause.code : 500,
-          reply_text: @disconnecting_cause ? @disconnecting_cause.text : cause.to_s,
-        )
       end
 
       if @keep_connected
@@ -291,7 +295,7 @@ class Connection
             connected!
           rescue SystemCallError => e
             @address_selector.failure!
-            connection_lost!(cause: e)
+            connection_closed!(cause: e)
           end
         else
           flush_out_buffer!
@@ -342,7 +346,7 @@ class Connection
       data = @socket.recv_nonblock(16384)
       raise EOFError if !data || data.empty?
     rescue SystemCallError, IOError => e
-      connection_lost!(cause: e)
+      connection_closed!(cause: e)
       return
     end
 
@@ -376,11 +380,18 @@ class Connection
                                         range: (@current_var[:idx]..(@current_var[:idx]+1)))
     send_frame(@poll_current_req.to_net)
 
-    @poll_timer = delay(2.seconds) do
+    @poll_timer.start!
+  end
+
+  def poll_timeout
+    if @current_meter && @current_var
       log.warn "Request addr=#{@current_meter[:bus_address]} idx=#{@current_var[:idx]} timeout"
-      @in_buffer.clear
-      run_poll_queue
+    else
+      log.err "Unexpected shit happened. cm=#{@current_meter} cv=#{@current_var}"
     end
+
+    @in_buffer.clear
+    run_poll_queue
   end
 
   def next_meter
@@ -419,20 +430,20 @@ class Connection
   def cycle_completed
     time_to_wait = 120.seconds - (Time.now - @last_cycle)
 
-    delay(time_to_wait) do
+    @cycle_timer = delay(time_to_wait) do
       @last_cycle = Time.now
       run_poll_queue
     end
   end
 
   def receive_frame(frame)
-    #log.debug("RX #{@current_var_symbol}=#{frame.get_f32(0)}")
+    debug1 { "RX bus_id=#{@current_meter[:bus_address]} #{@current_var_symbol}=#{frame.get_f32(0)}" }
 
     @current_meter_values[@current_var_symbol] = frame.get_f32(0)
 
     @poll_timer.stop!
 
-    delay(0.25.seconds) do
+    @inter_request_timer = delay(0.25.seconds) do
       run_poll_queue
     end
   end

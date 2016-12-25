@@ -47,14 +47,15 @@ class App < Ygg::Agent::Base
       AcaoMeter::Connection.new(
         actor_name: "conn-#{bus[:address]}:#{bus[:port]}",
         host: bus[:address], port: bus[:port],
-        debug: 3,
-        debug_data: mycfg.debug_data,
-        debug_serial: mycfg.debug_serial,
-        debug_serial_raw: mycfg.debug_serial_raw,
         amqp: @amqp,
         amqp_chan: @amqp_chan,
         exchange: mycfg.exchange,
         meters: bus[:meters],
+        keep_connected: true,
+        debug: 3,
+        debug_data: mycfg.debug_data,
+        debug_serial: mycfg.debug_serial,
+        debug_serial_raw: mycfg.debug_serial_raw,
       )
     end
   end
