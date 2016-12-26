@@ -385,7 +385,7 @@ class Connection
 
   def poll_timeout
     if @current_meter && @current_var
-      log.warn "Request addr=#{@current_meter[:bus_address]} idx=#{@current_var[:idx]} timeout"
+      log.info "Timeout bus_addr=#{@current_meter[:bus_address]} idx=#{@current_var[:idx]}"
     else
       log.err "Unexpected shit happened. cm=#{@current_meter} cv=#{@current_var}"
     end
@@ -437,7 +437,7 @@ class Connection
   end
 
   def receive_frame(frame)
-    debug1 { "RX bus_id=#{@current_meter[:bus_address]} #{@current_var_symbol}=#{frame.get_f32(0)}" }
+    debug_data { "RX bus_addr=#{@current_meter[:bus_address]} #{@current_var_symbol}=#{frame.get_f32(0)}" }
 
     @current_meter_values[@current_var_symbol] = frame.get_f32(0)
 
@@ -478,6 +478,7 @@ class Connection
   def debug1(&block) ; log.debug block.call if @debug >= 1 ; end
   def debug2(&block) ; log.debug block.call if @debug >= 2 ; end
   def debug3(&block) ; log.debug block.call if @debug >= 3 ; end
+  def debug_data(&block) ; log.debug block.call if @debug_data ; end
   def debug_serial(&block) ; log.debug block.call if @debug_serial ; end
   def debug_serial_raw(&block) ; log.debug block.call if @debug_serial_raw ; end
 end

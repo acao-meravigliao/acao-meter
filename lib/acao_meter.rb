@@ -27,6 +27,7 @@ class App < Ygg::Agent::Base
   end
 
   def prepare_options(o)
+    o.on("--debug", "Generic debugging [LEVEL]") { |v| @config['acao_meter.debug'] = v ? v.to_i : 1 }
     o.on("--debug-data", "Logs decoded data") { |v| @config['acao_meter.debug_data'] = true }
     o.on("--debug-serial", "Logs serial lines") { |v| @config['acao_meter.debug_serial'] = true }
     o.on("--debug-serial-raw", "Logs serial bytes") { |v| @config['acao_meter.debug_serial_raw'] = true }
@@ -52,7 +53,7 @@ class App < Ygg::Agent::Base
         exchange: mycfg.exchange,
         meters: bus[:meters],
         keep_connected: true,
-        debug: 3,
+        debug: mycfg.debug || 0,
         debug_data: mycfg.debug_data,
         debug_serial: mycfg.debug_serial,
         debug_serial_raw: mycfg.debug_serial_raw,
