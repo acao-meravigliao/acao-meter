@@ -428,7 +428,7 @@ class Connection
   end
 
   def cycle_completed
-    time_to_wait = 120.seconds - (Time.now - @last_cycle)
+    time_to_wait = [ 120.seconds - (Time.now - @last_cycle), 1 ].max
 
     @cycle_timer = delay(time_to_wait) do
       @last_cycle = Time.now
@@ -437,6 +437,11 @@ class Connection
   end
 
   def receive_frame(frame)
+    if !@current_meter
+      log.warn "Received frame with current_meter=nil"
+      return
+    end
+
     debug_data { "RX bus_addr=#{@current_meter[:bus_address]} #{@current_var_symbol}=#{frame.get_f32(0)}" }
 
     @current_meter_values[@current_var_symbol] = frame.get_f32(0)
