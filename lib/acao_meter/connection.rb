@@ -268,14 +268,12 @@ class Connection
       return
     end
 
-    if sent == 0
-      actor_epoll.mod(@socket, AM::Epoll::IN | AM::Epoll::OUT)
-    end
-
     if @out_buffer.empty?
       actor_epoll.mod(@socket, AM::Epoll::IN)
 
       out_buffer_empty!
+    else
+      actor_epoll.mod(@socket, AM::Epoll::IN | AM::Epoll::OUT)
     end
   end
 
